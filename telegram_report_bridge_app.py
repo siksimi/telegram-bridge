@@ -28,17 +28,13 @@ def load_state():
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                state = json.load(f)
+                state.setdefault("users", {})
+                return state
         except Exception:
             pass
     return {
         "users": {},
-        "latest_audio": {
-            "audio_url": None,
-            "updated_at": None,
-            "telegram_file_id": None,
-            "telegram_message_id": None
-        }
     }
 
 
@@ -69,6 +65,56 @@ def generate_alias():
 
 def now_kst_str():
     return datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def empty_audio_state():
+    return {
+        "audio_url": None,
+        "updated_at": None,
+        "telegram_file_id": None,
+        "telegram_message_id": None,
+    }
+
+
+def get_user_by_alias(alias):
+    normalized = (alias or "").strip().lower()
+    if not normalized:
+        return None
+
+    for user in state["users"].values():
+        if user.get("alias") == normalized:
+            user.setdefault("latest_audio", empty_audio_state())
+            return user
+    return None
+
+
+def get_or_create_user(chat_id_str):
+    user = state["users"].get(chat_id_str)
+    created = False
+
+    if not user:
+        user = {
+            "alias": generate_alias(),
+            "text": "",
+            "message_id": None,
+            "updated_at": None,
+            "latest_audio": empty_audio_state(),
+        }
+        state["users"][chat_id_str] = user
+        created = True
+    else:
+        user.setdefault("latest_audio", empty_audio_state())
+
+    return user, created
+
+
+def get_referenced_audio_filenames():
+    keep_filenames = set()
+    for user in state["users"].values():
+        audio_url = (user.get("latest_audio") or {}).get("audio_url")
+        if audio_url:
+            keep_filenames.add(os.path.basename(audio_url))
+    return keep_filenames
 
 
 # ---------------------------
@@ -118,10 +164,11 @@ def download_telegram_file(file_id):
 # 로컬 최신 오디오 정리 (선택)
 # ---------------------------
 
-def cleanup_old_audio(keep_filename=None):
+def cleanup_old_audio(keep_filenames=None):
+    keep_filenames = set(keep_filenames or set())
     try:
         for name in os.listdir(AUDIO_DIR):
-            if keep_filename and name == keep_filename:
+            if name in keep_filenames:
                 continue
             path = os.path.join(AUDIO_DIR, name)
             if os.path.isfile(path):
@@ -149,13 +196,13 @@ def api_latest():
         return jsonify({"error": "alias required"}), 400
 
     with state_lock:
-        for user in state["users"].values():
-            if user.get("alias") == alias:
-                return jsonify({
-                    "text": user.get("text", ""),
-                    "message_id": user.get("message_id"),
-                    "updated_at": user.get("updated_at")
-                })
+        user = get_user_by_alias(alias)
+        if user:
+            return jsonify({
+                "text": user.get("text", ""),
+                "message_id": user.get("message_id"),
+                "updated_at": user.get("updated_at")
+            })
 
     return jsonify({
         "text": "",
@@ -166,8 +213,15 @@ def api_latest():
 
 @app.get("/api/latest_audio")
 def api_latest_audio():
+    alias = request.args.get("alias", "").strip().lower()
+    if not alias:
+        return jsonify({"error": "alias required"}), 400
+
     with state_lock:
-        return jsonify(state.get("latest_audio", {}))
+        user = get_user_by_alias(alias)
+        if user:
+            return jsonify(user.get("latest_audio", empty_audio_state()))
+        return jsonify(empty_audio_state())
 
 
 @app.get("/api/users")
@@ -206,35 +260,15 @@ def telegram_webhook():
     voice = message.get("voice")
 
     with state_lock:
+        chat_id_str = str(chat_id)
+        user, created = get_or_create_user(chat_id_str)
+
         # 1) 텍스트 처리
         if text:
-            chat_id_str = str(chat_id)
-            user = state["users"].get(chat_id_str)
-
-            if not user:
-                alias = generate_alias()
-                state["users"][chat_id_str] = {
-                    "alias": alias,
-                    "text": text,
-                    "message_id": message_id,
-                    "updated_at": now_kst_str()
-                }
-                save_state()
-
-                try:
-                    send_message(
-                        chat_id,
-                        f"[Telegram Bridge]\n\n"
-                        f"Your alias: {alias}\n"
-                        f"Use this alias in RadSYS."
-                    )
-                except Exception as e:
-                    print("send_message failed:", e)
-            else:
-                user["text"] = text
-                user["message_id"] = message_id
-                user["updated_at"] = now_kst_str()
-                save_state()
+            user["text"] = text
+            user["message_id"] = message_id
+            user["updated_at"] = now_kst_str()
+            save_state()
 
         # 2) 음성 처리
         if voice:
@@ -243,17 +277,27 @@ def telegram_webhook():
                 try:
                     filename, _ = download_telegram_file(file_id)
 
-                    cleanup_old_audio(keep_filename=filename)
-
-                    state["latest_audio"] = {
+                    user["latest_audio"] = {
                         "audio_url": f"{PUBLIC_BASE_URL}/audio/{filename}",
                         "updated_at": now_kst_str(),
                         "telegram_file_id": file_id,
                         "telegram_message_id": message_id
                     }
                     save_state()
+                    cleanup_old_audio(keep_filenames=get_referenced_audio_filenames())
                 except Exception as e:
                     print("voice handling failed:", e)
+
+        if created:
+            try:
+                send_message(
+                    chat_id,
+                    f"[Telegram Bridge]\n\n"
+                    f"Your alias: {user['alias']}\n"
+                    f"Use this alias in RadSYS."
+                )
+            except Exception as e:
+                print("send_message failed:", e)
 
     return jsonify({"ok": True})
 
