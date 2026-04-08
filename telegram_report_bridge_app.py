@@ -2,170 +2,158 @@ from flask import Flask, request, jsonify, render_template_string
 import os
 import threading
 import requests
+import json
+import time
+import secrets
+import string
 
 app = Flask(__name__)
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "change-me")
-ALLOWED_CHAT_ID = os.environ.get("ALLOWED_CHAT_ID", "")  # optional: your Telegram numeric chat id
-PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "")  # e.g. https://example.com
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "")
 
+STATE_FILE = "state.json"
 state_lock = threading.Lock()
-latest_text = ""
-latest_meta = {
-    "chat_id": None,
-    "message_id": None,
-}
 
-PAGE_HTML = """
-<!doctype html>
-<html lang="ko">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Telegram Report Bridge</title>
-  <style>
-    body { font-family: Arial, sans-serif; margin: 24px; }
-    .wrap { max-width: 1000px; margin: 0 auto; }
-    textarea {
-      width: 100%;
-      height: 420px;
-      box-sizing: border-box;
-      font-family: Consolas, monospace;
-      font-size: 14px;
-      padding: 12px;
-      white-space: pre-wrap;
-    }
-    .toolbar {
-      display: flex;
-      gap: 8px;
-      margin: 12px 0;
-      flex-wrap: wrap;
-    }
-    button {
-      padding: 10px 14px;
-      cursor: pointer;
-      font-size: 14px;
-    }
-    .meta {
-      color: #666;
-      font-size: 13px;
-      margin-bottom: 8px;
-    }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <h2>Latest Telegram Text</h2>
-    <div class="meta" id="meta"></div>
-    <div class="toolbar">
-      <button onclick="refreshText()">Refresh</button>
-      <button onclick="copyText()">Copy</button>
-      <button onclick="clearText()">Clear</button>
-    </div>
-    <textarea id="box" placeholder="No text yet"></textarea>
-  </div>
+# ---------------------------
+# 상태 로드/저장
+# ---------------------------
 
-  <script>
-    async function refreshText() {
-      const res = await fetch('/api/latest');
-      const data = await res.json();
-      document.getElementById('box').value = data.text || '';
-      const meta = [];
-      if (data.chat_id !== null) meta.push('chat_id: ' + data.chat_id);
-      if (data.message_id !== null) meta.push('message_id: ' + data.message_id);
-      document.getElementById('meta').textContent = meta.join(' | ');
-    }
+def load_state():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    return {"users": {}}
 
-    async function copyText() {
-      const box = document.getElementById('box');
-      try {
-        await navigator.clipboard.writeText(box.value);
-      } catch (e) {
-        box.select();
-        document.execCommand('copy');
-      }
-    }
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
 
-    async function clearText() {
-      await fetch('/api/clear', { method: 'POST' });
-      await refreshText();
-    }
+state = load_state()
 
-    refreshText();
-    setInterval(refreshText, 3000);
-  </script>
-</body>
-</html>
-"""
+# ---------------------------
+# alias 생성 (4자리)
+# ---------------------------
 
+def generate_alias():
+    alphabet = string.ascii_lowercase + string.digits
+    while True:
+        alias = ''.join(secrets.choice(alphabet) for _ in range(4))
+        # 중복 체크
+        if not any(u["alias"] == alias for u in state["users"].values()):
+            return alias
 
-def is_allowed_chat(chat_id: int) -> bool:
-    if not ALLOWED_CHAT_ID:
-        return True
-    return str(chat_id) == str(ALLOWED_CHAT_ID)
+# ---------------------------
+# 텔레그램 메시지 보내기
+# ---------------------------
 
+def send_message(chat_id, text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    requests.post(url, json={
+        "chat_id": chat_id,
+        "text": text
+    }, timeout=10)
 
-@app.get("/")
-def index():
-    return render_template_string(PAGE_HTML)
-
-
-@app.get("/api/latest")
-def api_latest():
-    with state_lock:
-      return jsonify({
-          "text": latest_text,
-          "chat_id": latest_meta["chat_id"],
-          "message_id": latest_meta["message_id"],
-      })
-
-
-@app.post("/api/clear")
-def api_clear():
-    global latest_text, latest_meta
-    with state_lock:
-        latest_text = ""
-        latest_meta = {"chat_id": None, "message_id": None}
-    return jsonify({"ok": True})
-
+# ---------------------------
+# webhook
+# ---------------------------
 
 @app.post(f"/telegram/webhook/{WEBHOOK_SECRET}")
 def telegram_webhook():
-    global latest_text, latest_meta
-
     update = request.get_json(silent=True) or {}
-    message = update.get("message") or update.get("edited_message") or {}
+    message = update.get("message") or {}
     chat = message.get("chat") or {}
-    chat_id = chat.get("id")
+
+    chat_id = str(chat.get("id"))
     text = message.get("text")
 
-    if not text or chat_id is None:
-        return jsonify({"ok": True, "ignored": True})
-
-    if not is_allowed_chat(chat_id):
-        return jsonify({"ok": True, "ignored": True, "reason": "chat_not_allowed"})
+    if not chat_id or not text:
+        return jsonify({"ok": True})
 
     with state_lock:
-        latest_text = text
-        latest_meta = {
-            "chat_id": chat_id,
-            "message_id": message.get("message_id"),
-        }
+        user = state["users"].get(chat_id)
+
+        # 신규 사용자
+        if not user:
+            alias = generate_alias()
+            state["users"][chat_id] = {
+                "alias": alias,
+                "text": text,
+                "message_id": message.get("message_id"),
+                "updated_at": time.time()
+            }
+            save_state(state)
+
+            # 사용자에게 alias 알려주기
+            internal_url = f"http://192.148.102.51:8080/u/{alias}"
+
+            send_message(chat_id,
+                f"[Telegram Bridge]\n\n"
+                f"Your alias: {alias}\n"
+                f"Internal page:\n{internal_url}"
+            )
+
+        else:
+            # 기존 사용자 → 텍스트만 업데이트
+            user["text"] = text
+            user["message_id"] = message.get("message_id")
+            user["updated_at"] = time.time()
+            save_state(state)
 
     return jsonify({"ok": True})
 
+# ---------------------------
+# API: alias 기반 조회
+# ---------------------------
+
+@app.get("/api/latest")
+def api_latest():
+    alias = request.args.get("alias")
+
+    if not alias:
+        return jsonify({"error": "alias required"}), 400
+
+    with state_lock:
+        for user in state["users"].values():
+            if user["alias"] == alias:
+                return jsonify({
+                    "text": user.get("text"),
+                    "message_id": user.get("message_id")
+                })
+
+    return jsonify({"text": ""})
+
+# ---------------------------
+# 디버그용 (옵션)
+# ---------------------------
+
+@app.get("/api/users")
+def api_users():
+    with state_lock:
+        return jsonify(state)
+
+# ---------------------------
+# webhook 설정
+# ---------------------------
 
 @app.post("/setup-webhook")
 def setup_webhook():
-    if not BOT_TOKEN or not PUBLIC_BASE_URL:
-        return jsonify({"ok": False, "error": "Set TELEGRAM_BOT_TOKEN and PUBLIC_BASE_URL first."}), 400
-
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
-    target = f"{PUBLIC_BASE_URL.rstrip('/')}/telegram/webhook/{WEBHOOK_SECRET}"
-    resp = requests.post(url, json={"url": target}, timeout=20)
-    return jsonify(resp.json()), resp.status_code
+    target = f"{PUBLIC_BASE_URL}/telegram/webhook/{WEBHOOK_SECRET}"
 
+    resp = requests.post(url, json={"url": target}, timeout=10)
+    return jsonify(resp.json())
+
+# ---------------------------
+# 간단 웹페이지 (테스트용)
+# ---------------------------
+
+@app.get("/")
+def index():
+    return "Telegram Bridge Running"
+
+# ---------------------------
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), debug=True)
+    app.run(host="0.0.0.0", port=8000)
