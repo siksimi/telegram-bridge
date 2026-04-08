@@ -6,6 +6,7 @@ import threading
 import secrets
 import string
 import requests
+from datetime import datetime, timedelta, timezone
 
 app = Flask(__name__)
 
@@ -50,6 +51,8 @@ state = load_state()
 
 os.makedirs(AUDIO_DIR, exist_ok=True)
 
+KST = timezone(timedelta(hours=9))
+
 
 # ---------------------------
 # alias 생성 (4자리)
@@ -62,6 +65,10 @@ def generate_alias():
         exists = any(u.get("alias") == alias for u in state["users"].values())
         if not exists:
             return alias
+
+
+def now_kst_str():
+    return datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
 
 # ---------------------------
@@ -210,7 +217,7 @@ def telegram_webhook():
                     "alias": alias,
                     "text": text,
                     "message_id": message_id,
-                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")
+                    "updated_at": now_kst_str()
                 }
                 save_state()
 
@@ -226,7 +233,7 @@ def telegram_webhook():
             else:
                 user["text"] = text
                 user["message_id"] = message_id
-                user["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                user["updated_at"] = now_kst_str()
                 save_state()
 
         # 2) 음성 처리
@@ -240,7 +247,7 @@ def telegram_webhook():
 
                     state["latest_audio"] = {
                         "audio_url": f"{PUBLIC_BASE_URL}/audio/{filename}",
-                        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "updated_at": now_kst_str(),
                         "telegram_file_id": file_id,
                         "telegram_message_id": message_id
                     }
