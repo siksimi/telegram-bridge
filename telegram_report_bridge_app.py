@@ -6,6 +6,7 @@ import threading
 import secrets
 import string
 import requests
+from urllib.parse import urlparse
 from datetime import datetime, timedelta, timezone
 
 app = Flask(__name__)
@@ -98,14 +99,58 @@ def get_or_create_user(chat_id_str):
             "text": "",
             "message_id": None,
             "updated_at": None,
+            "bot_text": "",
+            "bot_message_id": None,
+            "bot_updated_at": None,
             "latest_audio": empty_audio_state(),
         }
         state["users"][chat_id_str] = user
         created = True
     else:
         user.setdefault("latest_audio", empty_audio_state())
+        user.setdefault("bot_text", "")
+        user.setdefault("bot_message_id", None)
+        user.setdefault("bot_updated_at", None)
 
     return user, created
+
+
+def get_user_by_chat_id(chat_id):
+    chat_id_str = str(chat_id)
+    return state["users"].get(chat_id_str)
+
+
+def get_latest_text_payload(user):
+    user_text = user.get("text", "")
+    user_message_id = user.get("message_id")
+    user_updated_at = user.get("updated_at")
+    bot_text = user.get("bot_text", "")
+    bot_message_id = user.get("bot_message_id")
+    bot_updated_at = user.get("bot_updated_at")
+
+    latest_sender = "user"
+    latest_text = user_text
+    latest_message_id = user_message_id
+    latest_updated_at = user_updated_at
+
+    if bot_updated_at and (not user_updated_at or bot_updated_at >= user_updated_at):
+        latest_sender = "bot"
+        latest_text = bot_text
+        latest_message_id = bot_message_id
+        latest_updated_at = bot_updated_at
+
+    return {
+        "text": latest_text or "",
+        "message_id": latest_message_id,
+        "updated_at": latest_updated_at,
+        "latest_sender": latest_sender if latest_updated_at else None,
+        "user_text": user_text,
+        "user_message_id": user_message_id,
+        "user_updated_at": user_updated_at,
+        "bot_text": bot_text,
+        "bot_message_id": bot_message_id,
+        "bot_updated_at": bot_updated_at,
+    }
 
 
 def get_referenced_audio_filenames():
@@ -160,6 +205,63 @@ def download_telegram_file(file_id):
     return filename, save_path
 
 
+def download_external_audio_file(audio_url):
+    parsed = urlparse(audio_url or "")
+    ext = os.path.splitext(parsed.path)[1] or ".wav"
+    filename = f"audio_{int(time.time())}{ext}"
+    save_path = os.path.join(AUDIO_DIR, filename)
+
+    r = requests.get(audio_url, timeout=60)
+    r.raise_for_status()
+
+    with open(save_path, "wb") as f:
+        f.write(r.content)
+
+    return filename, save_path
+
+
+def set_latest_audio_for_user(user, filename, file_id=None, message_id=None):
+    user["latest_audio"] = {
+        "audio_url": f"{PUBLIC_BASE_URL}/audio/{filename}",
+        "updated_at": now_kst_str(),
+        "telegram_file_id": file_id,
+        "telegram_message_id": message_id,
+    }
+    save_state()
+    cleanup_old_audio(keep_filenames=get_referenced_audio_filenames())
+
+
+def extract_audio_attachment(message):
+    voice = message.get("voice")
+    if voice and voice.get("file_id"):
+        return {
+            "file_id": voice.get("file_id"),
+            "kind": "voice",
+        }
+
+    audio = message.get("audio")
+    if audio and audio.get("file_id"):
+        return {
+            "file_id": audio.get("file_id"),
+            "kind": "audio",
+        }
+
+    document = message.get("document") or {}
+    file_name = (document.get("file_name") or "").lower()
+    mime_type = (document.get("mime_type") or "").lower()
+    if document.get("file_id") and (
+        file_name.endswith((".wav", ".mp3", ".m4a", ".ogg", ".aac"))
+        or mime_type.startswith("audio/")
+    ):
+        return {
+            "file_id": document.get("file_id"),
+            "kind": "document",
+            "file_name": document.get("file_name"),
+        }
+
+    return None
+
+
 # ---------------------------
 # 로컬 최신 오디오 정리 (선택)
 # ---------------------------
@@ -198,16 +300,19 @@ def api_latest():
     with state_lock:
         user = get_user_by_alias(alias)
         if user:
-            return jsonify({
-                "text": user.get("text", ""),
-                "message_id": user.get("message_id"),
-                "updated_at": user.get("updated_at")
-            })
+            return jsonify(get_latest_text_payload(user))
 
     return jsonify({
         "text": "",
         "message_id": None,
-        "updated_at": None
+        "updated_at": None,
+        "latest_sender": None,
+        "user_text": "",
+        "user_message_id": None,
+        "user_updated_at": None,
+        "bot_text": "",
+        "bot_message_id": None,
+        "bot_updated_at": None,
     })
 
 
@@ -244,10 +349,50 @@ def setup_webhook():
     return jsonify(result)
 
 
+@app.post("/api/register_bot_audio")
+def register_bot_audio():
+    payload = request.get_json(silent=True) or {}
+    alias = (payload.get("alias") or "").strip().lower()
+    chat_id = payload.get("chat_id")
+    file_id = (payload.get("file_id") or "").strip()
+    audio_url = (payload.get("audio_url") or "").strip()
+    message_id = payload.get("message_id")
+
+    if not alias and not chat_id:
+        return jsonify({"ok": False, "error": "alias or chat_id required"}), 400
+    if not file_id and not audio_url:
+        return jsonify({"ok": False, "error": "file_id or audio_url required"}), 400
+
+    with state_lock:
+        user = get_user_by_alias(alias) if alias else None
+        if not user and chat_id is not None:
+            user = get_user_by_chat_id(chat_id)
+        if not user:
+            return jsonify({"ok": False, "error": "user not found"}), 404
+
+        try:
+            if file_id:
+                filename, _ = download_telegram_file(file_id)
+                set_latest_audio_for_user(user, filename, file_id=file_id, message_id=message_id)
+            else:
+                filename, _ = download_external_audio_file(audio_url)
+                set_latest_audio_for_user(user, filename, file_id=None, message_id=message_id)
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    return jsonify({"ok": True, "latest_audio": user.get("latest_audio")})
+
+
 @app.post(f"/telegram/webhook/{WEBHOOK_SECRET}")
 def telegram_webhook():
     update = request.get_json(silent=True) or {}
-    message = update.get("message") or update.get("edited_message") or {}
+    message = (
+        update.get("message")
+        or update.get("edited_message")
+        or update.get("channel_post")
+        or update.get("edited_channel_post")
+        or {}
+    )
 
     chat = message.get("chat") or {}
     chat_id = chat.get("id")
@@ -257,7 +402,7 @@ def telegram_webhook():
         return jsonify({"ok": True, "ignored": True})
 
     text = message.get("text")
-    voice = message.get("voice")
+    audio_attachment = extract_audio_attachment(message)
 
     with state_lock:
         chat_id_str = str(chat_id)
@@ -267,12 +412,16 @@ def telegram_webhook():
         if text:
             if text.strip().lower() == "/alias":
                 try:
-                    send_message(
-                        chat_id,
+                    bot_text = (
                         f"[Telegram Bridge]\n\n"
                         f"Your alias: {user['alias']}\n"
                         f"Use this alias in RadSYS."
                     )
+                    result = send_message(chat_id, bot_text)
+                    user["bot_text"] = bot_text
+                    user["bot_message_id"] = (result.get("result") or {}).get("message_id")
+                    user["bot_updated_at"] = now_kst_str()
+                    save_state()
                 except Exception as e:
                     print("send_message failed:", e)
                 return jsonify({"ok": True})
@@ -282,32 +431,27 @@ def telegram_webhook():
             user["updated_at"] = now_kst_str()
             save_state()
 
-        # 2) 음성 처리
-        if voice:
-            file_id = voice.get("file_id")
-            if file_id:
-                try:
-                    filename, _ = download_telegram_file(file_id)
-
-                    user["latest_audio"] = {
-                        "audio_url": f"{PUBLIC_BASE_URL}/audio/{filename}",
-                        "updated_at": now_kst_str(),
-                        "telegram_file_id": file_id,
-                        "telegram_message_id": message_id
-                    }
-                    save_state()
-                    cleanup_old_audio(keep_filenames=get_referenced_audio_filenames())
-                except Exception as e:
-                    print("voice handling failed:", e)
+        # 2) 음성/오디오 파일 처리
+        if audio_attachment:
+            file_id = audio_attachment.get("file_id")
+            try:
+                filename, _ = download_telegram_file(file_id)
+                set_latest_audio_for_user(user, filename, file_id=file_id, message_id=message_id)
+            except Exception as e:
+                print(f"{audio_attachment.get('kind', 'audio')} handling failed:", e)
 
         if created:
             try:
-                send_message(
-                    chat_id,
+                bot_text = (
                     f"[Telegram Bridge]\n\n"
                     f"Your alias: {user['alias']}\n"
                     f"Use this alias in RadSYS."
                 )
+                result = send_message(chat_id, bot_text)
+                user["bot_text"] = bot_text
+                user["bot_message_id"] = (result.get("result") or {}).get("message_id")
+                user["bot_updated_at"] = now_kst_str()
+                save_state()
             except Exception as e:
                 print("send_message failed:", e)
 
