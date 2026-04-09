@@ -265,6 +265,18 @@ def telegram_webhook():
 
         # 1) 텍스트 처리
         if text:
+            if text.strip().lower() == "/alias":
+                try:
+                    send_message(
+                        chat_id,
+                        f"[Telegram Bridge]\n\n"
+                        f"Your alias: {user['alias']}\n"
+                        f"Use this alias in RadSYS."
+                    )
+                except Exception as e:
+                    print("send_message failed:", e)
+                return jsonify({"ok": True})
+
             user["text"] = text
             user["message_id"] = message_id
             user["updated_at"] = now_kst_str()
